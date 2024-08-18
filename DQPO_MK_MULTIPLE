@@ -1,0 +1,342 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from pyqubo import Array, Placeholder
+from dwave.system import DWaveSampler, EmbeddingComposite
+from scipy.optimize import minimize  # 导入 minimize 函数
+import os
+
+budget = 1000000000
+
+def download_data(tickers, start_date, end_date):
+    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    return data
+
+def calculate_metrics(data):
+    returns = data.pct_change().dropna()
+    annual_returns = returns.mean() * 252
+    annual_volatility = returns.var() * 252
+    cov_matrix = returns.cov() * 252
+    #print(cov_matrix)
+    return annual_returns, annual_volatility, cov_matrix
+
+def fractional_formulation(data, annual_returns, annual_volatility, cov_matrix):
+    last_closing_prices = data.iloc[-1]
+    fractional_price = last_closing_prices / budget
+    fractional_return = fractional_price * annual_returns
+    fractional_volatility = fractional_price * annual_volatility
+    fractional_price_hadamar = np.outer(fractional_price, np.ones_like(fractional_price))
+    fractional_cov_matrix = (fractional_price_hadamar * cov_matrix).transpose() * fractional_price_hadamar
+    return last_closing_prices, fractional_price, fractional_return, fractional_volatility, fractional_cov_matrix
+
+def Quantum_formulation(last_closing_prices):
+    nmax = budget / last_closing_prices
+    nmax_int = np.floor(budget / last_closing_prices).astype(int)
+    demanded_bits = nmax_int.apply(lambda x: x.bit_length())
+    #print(demanded_bits)
+    return nmax, nmax_int, demanded_bits
+
+def binary_conversion_matrix(last_closing_prices):
+    dimensions = [int(np.floor(np.log2(budget / p))) for p in last_closing_prices]
+    total_columns = sum(dimensions) + len(dimensions)
+    matrix_c = np.zeros((len(last_closing_prices), total_columns))
+    column_index = 0
+    for i in range(len(last_closing_prices)):
+        for j in range(dimensions[i] + 1):
+            matrix_c[i, column_index + j] = 2 ** j
+        column_index += dimensions[i] + 1
+        
+    #print(last_closing_prices)
+    #print([(budget / p) for p in last_closing_prices])
+    #print([int(np.floor(budget / p))for p in last_closing_prices])
+    #print(dimensions)
+    return matrix_c
+
+def portfolio_bits_formulation(matrix_c, fractional_return, fractional_cov_matrix):
+    portfolio_bits_return = np.dot(matrix_c.transpose(), fractional_return)
+    portfolio_bits_volatility = np.dot(np.dot(matrix_c.transpose(), fractional_cov_matrix), matrix_c)
+    #print(portfolio_return)
+    #print(np.dot(matrix_c.transpose(), fractional_cov_matrix))
+    #print(portfolio_volatility)
+    return portfolio_bits_return, portfolio_bits_volatility
+
+def build_qubo(portfolio_bits_return, portfolio_bits_volatility, matrix_c, fractional_price, last_closing_prices, budget):
+    b = Array.create('b', len(portfolio_bits_return), 'BINARY')
+    q = 1  # parameter
+    H = -sum(b[i] * portfolio_bits_return[i] for i in range(len(b))) + q * sum(
+        b[i] * portfolio_bits_volatility[i, j] * b[j] for i in range(len(b)) for j in range(len(b)))
+    
+    # Budget constraint
+    # budget_constraint = sum((matrix_c @ b)[i] * fractional_price[i] for i in range(len(fractional_price))) - 1
+    budget_constraint = sum((matrix_c @ b)[i] * last_closing_prices[i] for i in range(len(fractional_price))) - budget
+
+    H += Placeholder("gamma") * budget_constraint ** 2
+
+    model = H.compile()
+    return model
+
+def solve_qubo_model(model, gamma_value=10.0):
+    qubo, offset = model.to_qubo(feed_dict={"gamma": gamma_value})
+    
+    # 使用D-Wave的嵌入复合样本器
+    sampler = EmbeddingComposite(DWaveSampler())
+    sampleset = sampler.sample_qubo(qubo, num_reads=1000)
+    
+    solution = sampleset.first.sample
+    b_solution = np.array([solution[f'b[{i}]'] for i in range(len(solution))])
+    return b_solution
+
+def result(matrix_c, b_solution, tickers, fractional_return, fractional_volatility, last_closing_prices):
+    # b_solution结果匹配matrix_c的矩阵
+    result_matrix = np.zeros_like(matrix_c)
+    flat_index = 0
+    for i in range(matrix_c.shape[0]):
+        for j in range(matrix_c.shape[1]):
+            if matrix_c[i, j] != 0:
+                result_matrix[i, j] = b_solution[flat_index]
+                flat_index += 1
+    
+    # 每只股票的资产数量
+    ticker_quantities = np.sum(result_matrix * matrix_c, axis=1)
+    
+    # 结果与tickers匹配
+    ticker_quantities_df = pd.DataFrame({
+        'Ticker': tickers,
+        'Quantity': ticker_quantities
+    })
+    # 计算return contribution, volatility contribution和capital consumed
+    return_contribution = ticker_quantities * fractional_return
+    volatility_contribution = ticker_quantities * fractional_volatility
+    capital_consumed = ticker_quantities * last_closing_prices
+        # 计算单只股票总和
+    total_return_contribution = np.sum(return_contribution)
+    total_volatility_contribution = np.sum(volatility_contribution)
+    total_capital_consumed = np.sum(capital_consumed)
+
+    # 计算组合总和
+    total_return_contribution = np.sum(return_contribution)
+    total_volatility_contribution = np.sum(volatility_contribution)
+    total_capital_consumed = np.sum(capital_consumed)
+    
+    # 将结果与tickers匹配
+    ticker_quantities_df = pd.DataFrame({
+        'Ticker': tickers,
+        'Quantity': ticker_quantities,
+        'Return Contribution': return_contribution,
+        'Volatility Contribution': volatility_contribution,
+        'Capital Consumed': capital_consumed
+    })
+
+    total_contributions_df = pd.DataFrame({
+        'Total Return Contribution': [total_return_contribution],
+        'Total Volatility Contribution': [total_volatility_contribution],
+        'Total Capital Consumed': [total_capital_consumed]
+    })
+    
+    return result_matrix, ticker_quantities_df, total_contributions_df
+
+# MK
+def portfolio_performance(weights, returns, covariance):
+    portfolio_return = np.sum(returns * weights)
+    portfolio_std = np.sqrt(np.dot(weights.T, np.dot(covariance, weights)))
+    return portfolio_return, portfolio_std
+    
+def min_variance(weights, returns, covariance):
+    return portfolio_performance(weights, returns, covariance)[1]
+
+def optimize_portfolio(returns, covariance):
+    num_assets = len(returns)
+    args = (returns, covariance)
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 1) for asset in range(num_assets))
+    result = minimize(min_variance, num_assets*[1./num_assets,], args=args, method='SLSQP', bounds=bounds, constraints=constraints)
+    return result
+
+def plot_efficient_frontier(returns, covariance, qubo_results, total_volatility_contribution, total_return_contribution, num_portfolios=10000):
+    results = np.zeros((3, num_portfolios))
+    for i in range(num_portfolios):
+        weights = np.random.random(len(returns))
+        weights /= np.sum(weights)
+        portfolio_return, portfolio_std = portfolio_performance(weights, returns, covariance)
+        results[0,i] = portfolio_std
+        results[1,i] = portfolio_return
+        results[2,i] = results[1,i] / results[0,i] # Sharpe ratio
+    
+    max_sharpe_idx = np.argmax(results[2])
+    sdp, rp = results[0,max_sharpe_idx], results[1,max_sharpe_idx]
+     
+    min_vol_idx = np.argmin(results[0])
+    sdp_min, rp_min = results[0,min_vol_idx], results[1,min_vol_idx]
+    
+    plt.figure(figsize=(10, 7))
+    plt.scatter(results[0,:],results[1,:],c=results[2,:],cmap='YlGnBu',marker='o')
+    plt.scatter(sdp, rp,marker='*',color='r',s=500, label='Maximum Sharpe ratio')
+    plt.scatter(sdp_min, rp_min,marker='*',color='g',s=500, label='Minimum volatility')
+    
+    for qubo_result in qubo_results:
+        plt.scatter(np.sqrt(qubo_result['volatility']), qubo_result['return'],marker='*', s=500, label=f"QUBO gamma={qubo_result['gamma']}")
+        
+    plt.title('Simulated Portfolio Optimization based on Efficient Frontier')
+    plt.xlabel('annualised volatility')
+    plt.ylabel('annualised returns')
+    plt.colorbar(label='Sharpe ratio')
+    plt.legend(labelspacing=0.5)
+    plt.show()
+
+    plot_file = 'efficient_frontier.png'
+    plt.savefig(plot_file)
+    return plot_file
+
+
+def visualize_data(annual_returns, annual_volatility, cov_matrix):
+    plt.figure(figsize=(14, 7))
+    plt.subplot(1, 2, 1)
+    annual_returns.plot(kind='bar', title='Annual Returns')
+    plt.subplot(1, 2, 2)
+    annual_volatility.plot(kind='bar', title='Annual Volatility')
+    plt.show()
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cov_matrix, cmap='coolwarm', interpolation='none')
+    plt.colorbar()
+    plt.xticks(range(len(cov_matrix.columns)), cov_matrix.columns, rotation=90)
+    plt.yticks(range(len(cov_matrix.columns)), cov_matrix.columns)
+    plt.title('Covariance Matrix')
+    plt.show()
+
+def save_to_excel(data, annual_returns, annual_volatility, cov_matrix, nmax, nmax_int, demanded_bits, 
+                  last_closing_prices, fractional_price, fractional_return, fractional_volatility, fractional_cov_matrix, matrix_c, 
+                  portfolio_bits_return, portfolio_bits_volatility, qubo_results, result_matrices, ticker_quantities_dfs, total_contributions_dfs, 
+                  plot_file, output_path):
+    with pd.ExcelWriter(output_path) as writer:
+        data.to_excel(writer, sheet_name='Historical Prices')
+        annual_returns.to_excel(writer, sheet_name='Annual Returns')
+        annual_volatility.to_excel(writer, sheet_name='Annual Volatility')
+        cov_matrix.to_excel(writer, sheet_name='Covariance Matrix')
+
+        qf_df = pd.DataFrame({
+            'Max N': nmax,
+            'Max Integral N': nmax_int,
+            'Bit Length': demanded_bits,
+        })
+        qf_df.to_excel(writer, sheet_name='QF')
+
+        ff_df = pd.DataFrame({
+            'Fractional Price': fractional_price.values,
+            'Fractional Return': fractional_return.values,
+            'Fractional Volatility': fractional_volatility.values
+        }, index=fractional_price.index)
+        ff_df.to_excel(writer, sheet_name='Fractional Data', startrow=0)
+
+        fractional_cov_matrix_df = pd.DataFrame(fractional_cov_matrix, index=fractional_price.index, columns=fractional_price.index)
+        fractional_cov_matrix_df.to_excel(writer, sheet_name='Fractional Data', startrow=len(ff_df) + 2)
+        matrix_c_df = pd.DataFrame(matrix_c)
+        matrix_c_df.to_excel(writer, sheet_name='Matrix C')
+
+        portfolio_bits_return_df = pd.DataFrame(portfolio_bits_return.flatten(), columns=['Portfolio Bits Return'])
+        portfolio_bits_volatility_df = pd.DataFrame(portfolio_bits_volatility.flatten(), columns=['Portfolio Bits Volatility'])
+
+        portfolio_bits_return_df.to_excel(writer, sheet_name='Portfolio Bits Return')
+        portfolio_bits_volatility_df.to_excel(writer, sheet_name='Portfolio Bits Volatility')
+
+        result_matrix_start_row = 0
+        ticker_quantities_start_row = 0
+        total_contributions_start_row = 0
+
+        for idx, (result_matrix, ticker_quantities_df, total_contributions_df, qubo_result) in enumerate(zip(result_matrices, ticker_quantities_dfs, total_contributions_dfs, qubo_results)):
+            gamma = qubo_result['gamma']
+            
+            result_matrix_df = pd.DataFrame(result_matrix)
+            result_matrix_df['Gamma'] = gamma
+            result_matrix_df.to_excel(writer, sheet_name='Combined Result Matrices', startrow=result_matrix_start_row, index=False)
+            result_matrix_start_row += len(result_matrix_df) + 2  # Add space between results
+            
+            ticker_quantities_df['Gamma'] = gamma
+            ticker_quantities_df.to_excel(writer, sheet_name='Combined Ticker Quantities', startrow=ticker_quantities_start_row, index=False)
+            ticker_quantities_start_row += len(ticker_quantities_df) + 2  # Add space between results
+            
+            total_contributions_df['Gamma'] = gamma
+            total_contributions_df.to_excel(writer, sheet_name='Combined Total Contributions', startrow=total_contributions_start_row, index=False)
+            total_contributions_start_row += len(total_contributions_df) + 2  # Add space between results
+
+        qubo_results_df = pd.DataFrame({
+            'Gamma': [qubo_result['gamma'] for qubo_result in qubo_results],
+            'Return': [qubo_result['return'] for qubo_result in qubo_results],
+            'Volatility': [qubo_result['volatility'] for qubo_result in qubo_results]
+        })
+        qubo_results_df.to_excel(writer, sheet_name='QUBO Results Summary')
+
+        worksheet = writer.sheets['QUBO Results Summary']
+        worksheet.insert_image('H2', plot_file)
+
+def run_multiple_qubo_models(model, gamma_values):
+    qubo_results = []
+    for gamma in gamma_values:
+        b_solution = solve_qubo_model(model, gamma_value=gamma)
+        qubo_results.append({'gamma': gamma, 'b_solution': b_solution})
+    return qubo_results
+        
+def main():
+    tickers = ['7203.T', '6758.T', '9432.T', '8306.T']
+    start_date = '2020-01-01'
+    end_date = '2023-01-01'
+    output_folder = 'C:\\QPO'
+    output_file = os.path.join(output_folder, 'stock_analysis_DQPO_MK_MULTIPLE.xlsx')
+    data = download_data(tickers, start_date, end_date)
+    annual_returns, annual_volatility, cov_matrix = calculate_metrics(data)
+    last_closing_prices, fractional_price, fractional_return, fractional_volatility, fractional_cov_matrix = fractional_formulation(data, 
+                                                                                                                                    annual_returns, 
+                                                                                                                                    annual_volatility, 
+                                                                                                                                    cov_matrix)
+    nmax, nmax_int, demanded_bits = Quantum_formulation(last_closing_prices)
+    matrix_c = binary_conversion_matrix(last_closing_prices)
+    portfolio_bits_return, portfolio_bits_volatility = portfolio_bits_formulation(matrix_c, fractional_return, fractional_cov_matrix)
+    model = build_qubo(portfolio_bits_return, portfolio_bits_volatility, matrix_c, fractional_price, last_closing_prices, budget)
+    gamma_values = [1.0, 10.0, 100.0, 1000.0, 2000.0, 4000.0, 6000.0, 8000.0, 10000.0]
+    qubo_results_raw = run_multiple_qubo_models(model, gamma_values)
+
+    qubo_results = []
+    result_matrices = []
+    ticker_quantities_dfs = []
+    total_contributions_dfs = []
+
+    for qubo_result in qubo_results_raw:
+        b_solution = qubo_result['b_solution']
+        result_matrix, ticker_quantities_df, total_contributions_df = result(matrix_c, b_solution, tickers, fractional_return, fractional_volatility, last_closing_prices)
+        
+        total_return_contribution = total_contributions_df['Total Return Contribution'].iloc[0]
+        total_volatility_contribution = total_contributions_df['Total Volatility Contribution'].iloc[0]
+        
+        qubo_results.append({
+            'gamma': qubo_result['gamma'],
+            'return': total_return_contribution,
+            'volatility': total_volatility_contribution
+        })
+
+        result_matrices.append(result_matrix)
+        ticker_quantities_dfs.append(ticker_quantities_df)
+        total_contributions_dfs.append(total_contributions_df)
+
+    optimized_result = optimize_portfolio(annual_returns, cov_matrix)
+    optimized_weights = optimized_result.x
+    print("Best Sharpe Ratio Weights:")
+    for ticker, weight in zip(tickers, optimized_weights):
+        print(f"{ticker}: {weight:.2%}")
+
+    # 获取最后的组合贡献
+    combined_total_return_contribution = sum([result['return'] for result in qubo_results])
+    combined_total_volatility_contribution = sum([result['volatility'] for result in qubo_results])
+    
+    plot_file = plot_efficient_frontier(annual_returns, cov_matrix, qubo_results, combined_total_volatility_contribution, combined_total_return_contribution)
+
+    visualize_data(annual_returns, annual_volatility, cov_matrix)
+    save_to_excel(data, annual_returns, annual_volatility, cov_matrix, nmax, nmax_int, demanded_bits, 
+                  last_closing_prices, fractional_price, fractional_return, fractional_volatility, fractional_cov_matrix, matrix_c, 
+                  portfolio_bits_return, portfolio_bits_volatility, qubo_results, result_matrices, ticker_quantities_dfs, total_contributions_dfs,  
+                  plot_file, output_file)
+    
+    print(f'Data saved to {output_file}')
+
+if __name__ == "__main__":
+    main()
